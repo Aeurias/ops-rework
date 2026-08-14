@@ -10,7 +10,7 @@
 [CmdletBinding()]
 param(
     [switch] $DryRun,
-    [ValidateSet('Live','Healthy','Maintenance','StaleSupervisor','PidMismatch','Offline','WatcherError','WatcherDisabled','DuplicateWorld','PathUnavailable','PathMismatch','MissingSupervisor','MalformedSupervisor')]
+    [ValidateSet('Live','Healthy','Maintenance','MaintenanceTaskUnknown','StaleSupervisor','PidMismatch','Offline','WatcherError','WatcherDisabled','DuplicateWorld','PathUnavailable','PathMismatch','MissingSupervisor','MalformedSupervisor')]
     [string] $TestScenario = 'Live'
 )
 
@@ -40,6 +40,7 @@ function ConvertTo-UtcDateTime {
 function Get-TaskSnapshot {
     param([Parameter(Mandatory)][string] $TaskName)
     if ($DryRun) {
+        if ($TestScenario -eq 'MaintenanceTaskUnknown') { return [pscustomobject]@{ Exists = $null; AccessUnavailable = $true; TaskName = $TaskName; Enabled = $null; State = 'Access unavailable'; LastRunTime = $null; LastTaskResult = $null; NextRunTime = $null } }
         switch ($TestScenario) {
             'Offline' { return [pscustomobject]@{ Exists = $true; AccessUnavailable = $false; TaskName = $TaskName; Enabled = $false; State = 'Ready'; LastRunTime = $null; LastTaskResult = 0; NextRunTime = $null } }
             'Maintenance' { return [pscustomobject]@{ Exists = $true; AccessUnavailable = $false; TaskName = $TaskName; Enabled = $false; State = 'Ready'; LastRunTime = $null; LastTaskResult = 0; NextRunTime = $null } }
@@ -112,7 +113,7 @@ function Read-JsonState {
 
 function Read-MaintenanceMarker {
     if ($DryRun) {
-        if ($TestScenario -eq 'Maintenance') { return [pscustomobject]@{ Active = $true; StartedUtc = ([datetime]::UtcNow).AddMinutes(-10).ToString('o'); StartedBy = 'TEST\operator'; Reason = 'Manual maintenance' } }
+        if ($TestScenario -in @('Maintenance','MaintenanceTaskUnknown')) { return [pscustomobject]@{ Active = $true; StartedUtc = ([datetime]::UtcNow).AddMinutes(-10).ToString('o'); StartedBy = 'TEST\operator'; Reason = 'Manual maintenance' } }
         return $null
     }
     if (-not (Test-Path -LiteralPath $MaintenanceMarker)) { return $null }
@@ -268,11 +269,15 @@ Write-Host "127.0.0.1:7878   : $(if($soapPortReachable){'Reachable'}else{'Unreac
 
 $maintenanceActive = $maintenance -and $maintenance.PSObject.Properties.Name -contains 'Active' -and [bool]$maintenance.Active
 $maintenanceInvalid = $maintenance -and $maintenance.PSObject.Properties.Name -contains 'Invalid' -and [bool]$maintenance.Invalid
+$watcherKnownDisabled = ($watcherTask.Exists -eq $true -and $watcherTask.AccessUnavailable -eq $false -and $watcherTask.Enabled -eq $false)
+$supervisorKnownDisabled = ($supervisorTask.Exists -eq $true -and $supervisorTask.AccessUnavailable -eq $false -and $supervisorTask.Enabled -eq $false)
+$taskStateUnknown = ($watcherTask.AccessUnavailable -eq $true -or $supervisorTask.AccessUnavailable -eq $true -or $watcherTask.Exists -ne $true -or $supervisorTask.Exists -ne $true)
 $overall = 'ERROR'
 if ($worlds.Count -gt 1) { $overall = 'ERROR' }
 elseif ($maintenanceInvalid) { $overall = 'ERROR' }
-elseif ($maintenanceActive -and ($watcherTask.Enabled -or $supervisorTask.Enabled)) { $overall = 'ERROR' }
-elseif ($maintenanceActive -and $worlds.Count -eq 0 -and -not $watcherTask.Enabled -and -not $supervisorTask.Enabled) { $overall = 'MAINTENANCE' }
+elseif ($maintenanceActive -and $taskStateUnknown) { $overall = 'ERROR' }
+elseif ($maintenanceActive -and ($watcherTask.Enabled -eq $true -or $supervisorTask.Enabled -eq $true)) { $overall = 'ERROR' }
+elseif ($maintenanceActive -and $worlds.Count -eq 0 -and $watcherKnownDisabled -and $supervisorKnownDisabled) { $overall = 'MAINTENANCE' }
 elseif ($worlds.Count -eq 0 -and -not $maintenanceActive) { $overall = 'OFFLINE' }
 elseif ($world -and $world.PathVerification -eq 'Mismatch') { $overall = 'ERROR' }
 elseif ($supervisorHealth.StateValid -eq $false) { $overall = 'ERROR' }

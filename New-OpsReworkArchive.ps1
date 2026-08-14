@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     The archive is assembled through a temporary staging directory. Credential
-    files, account notes, runtime state, logs, task exports, and existing ZIPs are
-    excluded by relative path before any included file is copied.
+    files are assembled from an explicit allow-list of current scripts and
+    documentation, so runtime material and historical folders cannot enter.
 #>
 [CmdletBinding()]
 param(
@@ -17,16 +17,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $OpsRoot = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
-$defaultOutputPath = Join-Path (Split-Path -Parent $OpsRoot) ('ops-rework-distribution-{0}.zip' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$defaultOutputPath = Join-Path $OpsRoot ('ops-rework-distribution-{0}.zip' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = $defaultOutputPath }
 $excludedPatterns = @(
     '^restart bot account\.txt$',
     '^state\\soap-credential\.xml$',
     '^state\\soap-credential\.xml\..+\.tmp$',
+    '^state\\soap-credential\.xml\..+\.lastgood\.bak$',
     '^state\\.*\.json$',
     '^state\\.*\.tmp$',
     '^state\\operator-marker-filesystem-test(?:\\|$)',
     '^logs(?:\\|$)',
+    '^test-artifacts(?:\\|$)',
+    '^backups(?:\\|$)',
     '^(?:watcher-task|supervisor-task)\.xml$',
     '\.zip$'
 )
@@ -42,9 +45,25 @@ function Test-IncludedFile {
     return $true
 }
 
-$files = @(Get-ChildItem -LiteralPath $OpsRoot -Recurse -File -Force | ForEach-Object {
-    $relative = Get-RelativePath -FullName $_.FullName
-    if (Test-IncludedFile -RelativePath $relative) { [pscustomobject]@{ File = $_; RelativePath = $relative } }
+$distributionNames = @(
+    'README.md',
+    'New-OpsReworkArchive.ps1',
+    'Register-RestartWatcher.ps1',
+    'Register-Supervisor.ps1',
+    'Restart-Watcher.ps1',
+    'Set-SoapCredential.ps1',
+    'Start-AzerothCore.ps1',
+    'Status-AzerothCore.ps1',
+    'Stop-AzerothCoreMaintenance.ps1',
+    'Test-CredentialRotation.ps1',
+    'Test-OperatorMaintenance.ps1',
+    'Test-RestartAutomation.ps1',
+    'Worldserver-Supervisor.ps1'
+)
+$files = @($distributionNames | ForEach-Object {
+    $path = Join-Path $OpsRoot $_
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required distribution file is missing: $path" }
+    [pscustomobject]@{ File = Get-Item -LiteralPath $path; RelativePath = $_ }
 })
 
 if ($ListOnly) {

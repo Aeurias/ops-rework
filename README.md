@@ -1,33 +1,24 @@
 # Safe AzerothCore worldserver restart watcher
 
-This is a staging replacement for the unsafe files in `C:\azeroth\ops`. Nothing in
-the production folder was overwritten, and no live worldserver restart was performed.
+This is the current small-server maintenance implementation for
+`C:\azeroth\build\bin\RelWithDebInfo`. It keeps authserver, MySQL, and the chatter
+bridge independent. The live configuration has been validated with controlled
+STOP/START and automatic restart tests.
 
-## Findings used by this design
+## Current design
 
-- `AzerothCore Restart` and `AzerothCore Memory Watchdog` are currently absent.
-- The old implementation used fixed 00:00/06:00/12:00/18:00 triggers, enabled
-  `StartWhenAvailable`, coupled authserver and the chatter bridge, used CTRL_BREAK,
-  and eventually used `Stop-Process -Force`. The historical log records a forced
-  worldserver termination at 21:05 on 13 August.
-- The first production automatic cycle on 2026-08-14 used worldserver PID 2852.
-  SOAP accepted the scheduled command and AzerothCore completed its native countdown,
-  but Windows exposed no usable restart exit code to the supervisor. The supervisor
-  therefore left the realm down until the administrator started its scheduled task,
-  which launched PID 5340. This is the reason process exit code is no longer restart
-  authority. Authserver is a separate process and is not part of this maintenance path.
-- The final read-only verification for this patch found authserver and both scheduled
-  tasks present, but no exact worldserver executable; the supervisor heartbeat naming
-  PID 5340 was stale. No recovery action was taken by this work.
-- The actual config is `C:\azeroth\build\bin\RelWithDebInfo\configs\worldserver.conf`:
-  `SOAP.Enabled = 1`, `SOAP.IP = "127.0.0.1"`, and `SOAP.Port = 7878`. The live
-  endpoint and world port were reachable. `Server.log` uses the actual readiness
-  marker `(worldserver-daemon) ready...`.
-- The chatter bridge source has a long-running loop and catches iteration failures,
-  but has no worldserver reconnect protocol. It uses the database rather than a
-  worldserver control socket. It is therefore deliberately left running and is not
-  coupled to maintenance; observe it after the controlled test and only intervene
-  if its own health check proves necessary.
+- `Restart-Watcher.ps1` runs once per minute, checks uptime, and uses authenticated
+  localhost SOAP. Automatic maintenance uses `server shutdown 300` after roughly
+  5h55; AzerothCore owns the countdown.
+- `Worldserver-Supervisor.ps1` is the single worldserver owner. It adopts an existing
+  process, validates readiness, and relaunches only when an exact PID/start-time
+  `Armed` + `Accepted` ticket authorizes one replacement.
+- Manual STOP uses only `server shutdown 1`, disables both tasks first, and never
+  force-kills a process. START re-enables the supervisor, waits for fresh heartbeat
+  and readiness, runs preflight, then enables the watcher.
+- STATUS is read-only. A process whose executable path is unavailable in the current
+  Windows token is reported as running but `DEGRADED`, never silently treated as offline.
+- SOAP credentials are DPAPI-protected for the task identity and are never logged.
 
 ## Files
 
@@ -49,9 +40,7 @@ the production folder was overwritten, and no live worldserver restart was perfo
   STATUS is read-only.
 - `Test-OperatorMaintenance.ps1`: non-destructive STOP/START/STATUS test harness.
 - `New-OpsReworkArchive.ps1`: distribution ZIP builder with credential/runtime exclusions.
-- `.gitignore`: excludes credentials, account notes, logs, runtime state, task exports,
-  and generated archives.
-- `logs\`: staging logs; `state\`: DPAPI credential and atomic restart state.
+- `logs\`: operational logs; `state\`: DPAPI credential and atomic restart state.
 
 ## Manual operator controls
 
@@ -257,8 +246,7 @@ automatic relaunch permission.
 
 ## Supervisor and live transition
 
-The current live process is already supervised; no adoption restart is required. The
-supervisor publishes `state\supervisor-state.json` atomically with its PID, the exact
+The supervisor publishes `state\supervisor-state.json` atomically with its PID, the exact
 worldserver PID and StartTimeUtc, supervisor start time, a heartbeat no older than
 30 seconds, script path, and `Status=Supervising`. It refreshes that heartbeat while
 waiting for readiness and while supervising.
@@ -273,9 +261,7 @@ restart is still aborted. That cosmetic result is intentional fail-safe behavior
 second validation must not be weakened. The supervisor removes its own state in
 `finally`; if it crashes, the stale heartbeat remains protective.
 
-The first production automatic cycle showed that the Windows Playerbot build can
-complete the accepted native countdown while exposing no usable restart exit code.
-The supervisor therefore reads the persistent ticket after every worldserver exit. It
+The supervisor reads the persistent ticket after every worldserver exit. It
 requires `Status=Armed`, `Intent=AutomaticSixHourRestart`,
 `ShutdownCommandStatus=Accepted`, the exact exited PID, and the exact exited
 StartTimeUtc. It consumes the ticket before launching and clears it only after the
@@ -335,7 +321,7 @@ Expected XML/configuration:
 - `MultipleInstances` `IgnoreNew`;
 - execution time limit `PT20M`;
 - action `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File
-  "C:\azeroth\ops-rework\Restart-Watcher.ps1"`, working directory staging root;
+  "C:\azeroth\ops-rework\Restart-Watcher.ps1"`, working directory ops-rework root;
 - principal is the selected task identity at highest run level. Production must use
   the same identity that provisioned the DPAPI file.
 
@@ -427,9 +413,8 @@ worldserver or use a termination fallback.
 
 ## Controlled live test
 
-This work intentionally stops before the destructive step. After the supervisor is
-running, the administrator should choose a quiet window and explicitly perform the
-following one test:
+For a future controlled validation, choose a quiet window and explicitly perform the
+following steps. The implementation has already completed this sequence once.
 
 1. Confirm the supervisor adopted the current PID and the watcher task is disabled
    until the final decision.
@@ -438,17 +423,16 @@ following one test:
    corresponding `Register-Supervisor.ps1 -RunAsUser ... -Enable` and
    `Register-RestartWatcher.ps1 -RunAsUser ... -Enable` commands. If the account is
    already logged on, use `Start-ScheduledTask` for the supervisor as shown above.
-4. For the single live test, wait until the actual uptime threshold, or alter the
-   threshold only in a reviewed staging copy. Do not invoke the watcher with a live
-   destructive override.
+4. Wait until the actual uptime threshold. If a shorter validation is required, use
+   an isolated reviewed test copy; do not add a production time override.
 5. Watch `logs\worldserver-restart-YYYY-MM.log`, `Server.log`, port 8085, and the
    supervisor console. Confirm the maintenance announcement, an `Armed` ticket with
    `ShutdownCommandStatus=Accepted`, AzerothCore native countdown, exact-ticket
    consumption, one new PID, fresh heartbeat, and readiness. Do not require exit code
    2; it is diagnostic only. Authserver and the bridge should remain running.
-6. Disable the task after validation if continued operation is not yet desired.
+6. Leave both tasks enabled only when normal automatic maintenance is desired.
 
-The staging watcher itself never exposes SOAP beyond 127.0.0.1 and never logs the
+The watcher never exposes SOAP beyond 127.0.0.1 and never logs the
 credential, password, or Authorization header.
 
 ## Distribution archive
@@ -462,13 +446,9 @@ overwrite an existing archive:
 .\New-OpsReworkArchive.ps1 -OutputPath C:\azeroth\ops-rework-distribution.zip
 ```
 
-The live `state\soap-credential.xml` is intentionally not removed or regenerated by
-this work. The ops-rework directory is not currently inside a Git repository; the
-account note is therefore not tracked by the available Git metadata. `.gitignore`
-still excludes it and all credential/runtime material if the directory is later
-placed under version control. The existing credential-named `.tmp` file was left
-untouched because its use could not be positively disproved without risking the
-working credential.
+The archive contains only the current scripts and README. It intentionally excludes
+`.git`, `_corrective-audit`, task XML exports, credentials, runtime state, logs,
+temporary tests, and existing ZIP files.
 
 ## Rollback / emergency disable
 
@@ -486,7 +466,4 @@ or ambiguous state requires the manual recovery procedure above:
 ```
 
 Do not use the old `Restart-Azeroth.ps1` or `Register-AzerothTasks.ps1`; they remain
-for audit/history only and contain unsafe behavior. No production file was deleted or
-changed by this staging work.
- 
- 
+outside this implementation and contain unsafe behavior.

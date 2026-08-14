@@ -213,18 +213,22 @@ function Invoke-FilesystemMarkerTest {
 
 function Get-ExactWorldserverProcesses {
     if ($DryRun) {
-        if ($TestScenario -in @('AlreadyStopped','PathMismatch')) { return @() }
+        if ($TestScenario -eq 'AlreadyStopped') { return @() }
+        if ($TestScenario -eq 'PathMismatch') { throw "Safety stop: worldserver PID=4299 has unexpected executable path 'C:\unexpected\worldserver.exe'. No shutdown command was sent." }
         if ($TestScenario -eq 'DuplicateWorld') { return @([pscustomobject]@{ Pid = 4201; StartTime = (Get-Date).AddHours(-1); StartTimeUtc = ([datetime]::UtcNow).AddHours(-1); Process = $null; Path = $WorldExe },[pscustomobject]@{ Pid = 4202; StartTime = (Get-Date).AddHours(-2); StartTimeUtc = ([datetime]::UtcNow).AddHours(-2); Process = $null; Path = $WorldExe }) }
         return @([pscustomobject]@{ Pid = 4201; StartTime = (Get-Date).AddHours(-1); StartTimeUtc = ([datetime]::UtcNow).AddHours(-1); Process = $null; Path = $WorldExe })
     }
     $expected = [IO.Path]::GetFullPath($WorldExe).TrimEnd('\').ToLowerInvariant()
-    try {
-        $rows = @(Get-CimInstance Win32_Process -Filter "Name='worldserver.exe'" | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath).TrimEnd('\').ToLowerInvariant() -eq $expected) })
-    } catch { throw "Could not inspect worldserver executable paths: $($_.Exception.Message)" }
+    try { $rows = @(Get-CimInstance Win32_Process -Filter "Name='worldserver.exe'" -ErrorAction Stop) } catch { throw "Could not inspect worldserver executable paths: $($_.Exception.Message)" }
     $result = foreach ($row in $rows) {
+        $path = [string]$row.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($path)) { throw "Safety stop: worldserver PID=$($row.ProcessId) exists but its executable path is unavailable. No shutdown command was sent." }
+        try { $actual = [IO.Path]::GetFullPath($path).TrimEnd('\').ToLowerInvariant() } catch { throw "Safety stop: worldserver PID=$($row.ProcessId) has an unreadable executable path. No shutdown command was sent." }
+        if ($actual -ne $expected) { throw "Safety stop: worldserver PID=$($row.ProcessId) has unexpected executable path '$path'. No shutdown command was sent." }
         $process = Get-Process -Id ([int]$row.ProcessId) -ErrorAction Stop
-        [pscustomobject]@{ Pid = [int]$row.ProcessId; StartTime = $process.StartTime; StartTimeUtc = $process.StartTime.ToUniversalTime(); Process = $process; Path = $row.ExecutablePath }
+        [pscustomobject]@{ Pid = [int]$row.ProcessId; StartTime = $process.StartTime; StartTimeUtc = $process.StartTime.ToUniversalTime(); Process = $process; Path = $path }
     }
+    if (@($rows).Count -gt 1) { throw "Safety stop: $(@($rows).Count) worldserver.exe processes exist. No shutdown command was sent." }
     return @($result)
 }
 

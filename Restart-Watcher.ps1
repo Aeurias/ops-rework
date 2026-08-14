@@ -22,11 +22,15 @@ param(
     [ValidateSet('Live','Missing','StaleHeartbeat','DeadSupervisor','PidMismatch','StartTimeMismatch','Valid','DisappearBeforeRestart')][string] $TestSupervisorState = 'Live',
     [datetime] $AtTime = [datetime]::MinValue,
     [int] $HoldLockSeconds = 0,
-    [string] $TestStateFile = ''
+    [string] $TestStateFile = '',
+    [string] $TestRoot = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($AtTime -ne [datetime]::MinValue -and -not $DryRun) {
+    throw '-AtTime may only be used with -DryRun.'
+}
 
 $OpsRoot = $PSScriptRoot
 $BinDir = 'C:\azeroth\build\bin\RelWithDebInfo'
@@ -37,6 +41,7 @@ $StateFile = Join-Path $OpsRoot 'state\restart-state.json'
 $InvalidStateWarningFile = Join-Path $OpsRoot 'state\restart-state-invalid-warning.json'
 $SupervisorStateFile = Join-Path $OpsRoot 'state\supervisor-state.json'
 $LogDir = Join-Path $OpsRoot 'logs'
+$LogPath = Join-Path $LogDir ('worldserver-restart-{0}.log' -f (Get-Date -Format 'yyyy-MM'))
 $SoapHost = '127.0.0.1'
 $SoapPort = 7878
 $WorldPort = 8085
@@ -47,6 +52,8 @@ $AutomaticIntent = 'AutomaticSixHourRestart'
 $AutomaticShutdownCommand = 'server shutdown 300'
 $PreparingBlockAfter = [TimeSpan]::FromMinutes(20)
 $PreparingWarningRepeatAfter = [TimeSpan]::FromHours(1)
+$AcceptedTicketGraceAfter = [TimeSpan]::FromMinutes(20)
+$AcceptedTicketWarningRepeatAfter = [TimeSpan]::FromHours(1)
 $InvalidStateWarningRepeatAfter = [TimeSpan]::FromHours(1)
 $script:SupervisorValidationCalls = 0
 $WatcherMutexName = if ($DryRun) { 'Global\AzerothCoreWorldserverRestartWatcherTest' } else { 'Global\AzerothCoreWorldserverRestartWatcher' }
@@ -55,6 +62,17 @@ if (-not [string]::IsNullOrWhiteSpace($TestStateFile)) {
     if (-not $DryRun) { throw '-TestStateFile requires -DryRun.' }
     $StateFile = [IO.Path]::GetFullPath($TestStateFile)
     $InvalidStateWarningFile = '{0}.invalid-warning.json' -f $StateFile
+}
+
+if (-not [string]::IsNullOrWhiteSpace($TestRoot)) {
+    if (-not $DryRun) { throw '-TestRoot requires -DryRun.' }
+    $testRootFull = [IO.Path]::GetFullPath($TestRoot)
+    $testStateDirectory = Join-Path $testRootFull 'state'
+    $LogDir = Join-Path $testRootFull 'logs'
+    $LogPath = Join-Path $LogDir 'restart-watcher-test.log'
+    $StateFile = Join-Path $testStateDirectory 'restart-state.json'
+    $InvalidStateWarningFile = Join-Path $testStateDirectory 'restart-state-invalid-warning.json'
+    $SupervisorStateFile = Join-Path $testStateDirectory 'supervisor-state.json'
 }
 
 if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -68,9 +86,8 @@ function Get-EffectiveNow {
 function Write-Log {
     param([Parameter(Mandatory)][string] $Message, [ValidateSet('INFO','WARN','ERROR','OK')][string] $Level = 'INFO')
     $now = Get-EffectiveNow
-    $file = Join-Path $LogDir ('worldserver-restart-{0}.log' -f $now.ToString('yyyy-MM'))
     $line = '{0} [{1,-5}] {2}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    Add-Content -LiteralPath $file -Value $line -Encoding UTF8
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
 }
 
 function Test-TcpPort {
@@ -232,11 +249,17 @@ function Write-AtomicJsonFile {
     $directory = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
     $tmp = '{0}.{1}.tmp' -f $Path, ([guid]::NewGuid().ToString('N'))
+    $backup = '{0}.{1}.bak' -f $Path, ([guid]::NewGuid().ToString('N'))
     try {
-        $Value | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmp -Encoding UTF8
-        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        $Value | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $tmp -Encoding UTF8
+        if (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($tmp,$Path,$backup,$true)
+        } else {
+            [IO.File]::Move($tmp,$Path)
+        }
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -292,6 +315,23 @@ function Handle-PreparingState {
         $State | Add-Member -NotePropertyName PreparingWarningLoggedUtc -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
         Write-State $State
     }
+}
+
+function Handle-ExpiredAcceptedTicket {
+    param([Parameter(Mandatory)] $State, [Parameter(Mandatory)] $World)
+    if ([string]$State.Status -ne 'Armed' -or -not ($State.PSObject.Properties.Name -contains 'ShutdownCommandStatus') -or [string]$State.ShutdownCommandStatus -ne 'Accepted' -or -not ($State.PSObject.Properties.Name -contains 'ExpectedShutdownUtc')) { return $false }
+    try { $expected = ConvertTo-UtcDateTime $State.ExpectedShutdownUtc } catch { return $false }
+    if (([datetime]::UtcNow - $expected) -lt $AcceptedTicketGraceAfter) { return $false }
+    $shouldLog = $true
+    if ($State.PSObject.Properties.Name -contains 'AcceptedOverdueWarningLoggedUtc') {
+        try { $shouldLog = (([datetime]::UtcNow - (ConvertTo-UtcDateTime $State.AcceptedOverdueWarningLoggedUtc)) -ge $AcceptedTicketWarningRepeatAfter) } catch { $shouldLog = $true }
+    }
+    if ($shouldLog) {
+        Write-Log 'Automatic maintenance blocked: Accepted restart ticket is overdue and requires administrator review.' 'ERROR'
+        $State | Add-Member -NotePropertyName AcceptedOverdueWarningLoggedUtc -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
+        Write-State $State
+    }
+    return $true
 }
 
 function Get-SoapCredential {
@@ -385,7 +425,54 @@ function Assert-Preflight {
         Write-Log ("Configured SOAP.Enabled={0}, SOAP.IP={1}, SOAP.Port={2}" -f $settings['Enabled'],$settings['IP'],$settings['Port']) 'INFO'
         if ($settings['Enabled'] -ne '1' -or $settings['IP'] -notmatch '127\.0\.0\.1' -or $settings['Port'] -notmatch '7878') { $ok = $false; Write-Log 'SOAP configuration is not the required localhost-only 7878 configuration.' 'ERROR' }
     }
-    $world = Get-WorldProcess
+    $world = $null
+    try { $world = Get-WorldProcess }
+    catch {
+        # A read-only preflight may run under a token that cannot read
+        # Win32_Process.ExecutablePath for the interactive worldserver.  Do
+        # not weaken the automatic path: use this fallback only to continue
+        # non-destructive port/SOAP checks and report the limitation clearly.
+        $processes = @(Get-Process -Name 'worldserver' -ErrorAction SilentlyContinue)
+        if ($processes.Count -eq 1) {
+            $process = $processes[0]
+            $parentPid = 0
+            try {
+                $row = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+                if ($row) { $parentPid = [int]$row.ParentProcessId }
+            } catch { }
+            $world = [pscustomobject]@{
+                Process = $process
+                Pid = [int]$process.Id
+                ParentPid = $parentPid
+                StartTime = $process.StartTime
+                StartTimeUtc = $process.StartTime.ToUniversalTime()
+                Path = $WorldExe
+                PathVerified = $false
+            }
+            Write-Log "Executable path inspection was unavailable ($($_.Exception.Message)); preflight will continue read-only using the single live worldserver PID." 'WARN'
+        } else { throw }
+    }
+    if ($null -eq $world -and $Preflight) {
+        $processes = @(Get-Process -Name 'worldserver' -ErrorAction SilentlyContinue)
+        if ($processes.Count -eq 1) {
+            $process = $processes[0]
+            $parentPid = 0
+            try {
+                $row = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+                if ($row) { $parentPid = [int]$row.ParentProcessId }
+            } catch { }
+            $world = [pscustomobject]@{
+                Process = $process
+                Pid = [int]$process.Id
+                ParentPid = $parentPid
+                StartTime = $process.StartTime
+                StartTimeUtc = $process.StartTime.ToUniversalTime()
+                Path = $WorldExe
+                PathVerified = $false
+            }
+            Write-Log 'Executable path inspection returned no path; preflight will continue read-only using the single live worldserver PID.' 'WARN'
+        }
+    }
     if ($null -eq $world) { Write-Log 'worldserver is not running; preflight cannot execute server info.' 'WARN'; return 1 }
     $session = if ($null -ne $world.Process) { $world.Process.SessionId } else { 'simulated' }
     Write-Log ("worldserver PID={0}, ParentPID={1}, StartTime={2}, Session={3}" -f $world.Pid,$world.ParentPid,$world.StartTime.ToString('o'),$session) 'INFO'
@@ -443,12 +530,19 @@ function Invoke-Watch {
             return 0
         }
         if (-not $sameIdentity) {
+            if ($stateStatus -eq 'Consumed') {
+                # A consumed ticket is owned by the supervisor lifecycle.  The
+                # watcher must not race the supervisor by clearing it merely
+                # because a replacement PID has appeared.
+                return 0
+            }
             Write-Log ("Restart state status '$stateStatus' belongs to old PID/start time; current PID={0}, StartTime={1}." -f $world.Pid,$world.StartTime.ToString('o')) 'INFO'
             Clear-State
             $state = $null
         } else {
             # Armed, Blocked, Ambiguous, and Consumed are all terminal for this
             # exact process. Never infer a new cycle from an existing ticket.
+            if ($stateStatus -eq 'Armed' -and (Handle-ExpiredAcceptedTicket -State $state -World $world)) { return 0 }
             return 0
         }
     }
@@ -470,7 +564,6 @@ function Invoke-Watch {
         PreparingStartedUtc = $nowUtc.ToString('o')
         ArmedAtUtc = $null
         ExpectedShutdownUtc = $nowUtc.AddSeconds($CountdownSeconds).ToString('o')
-        ExpectedRestartUtc = $nowUtc.AddSeconds($CountdownSeconds).ToString('o')
         ShutdownCommand = $AutomaticShutdownCommand
         ShutdownCommandStatus = 'NotSubmitted'
     }
@@ -490,7 +583,6 @@ function Invoke-Watch {
         PreparingStartedUtc = $nowUtc.ToString('o')
         ArmedAtUtc = $armedAtUtc.ToString('o')
         ExpectedShutdownUtc = $armedAtUtc.AddSeconds($CountdownSeconds).ToString('o')
-        ExpectedRestartUtc = $armedAtUtc.AddSeconds($CountdownSeconds).ToString('o')
         ShutdownCommand = $AutomaticShutdownCommand
         ShutdownCommandStatus = 'Pending'
     }
@@ -507,7 +599,6 @@ function Invoke-Watch {
             PreparingStartedUtc = $armedState.PreparingStartedUtc
             ArmedAtUtc = $armedState.ArmedAtUtc
             ExpectedShutdownUtc = $armedState.ExpectedShutdownUtc
-            ExpectedRestartUtc = $armedState.ExpectedRestartUtc
             ShutdownCommand = $armedState.ShutdownCommand
             ShutdownCommandStatus = $failureStatus
             FailureReason = [string]$shutdown.Reason
@@ -525,7 +616,6 @@ function Invoke-Watch {
         PreparingStartedUtc = $armedState.PreparingStartedUtc
         ArmedAtUtc = $armedState.ArmedAtUtc
         ExpectedShutdownUtc = $armedState.ExpectedShutdownUtc
-        ExpectedRestartUtc = $armedState.ExpectedRestartUtc
         ShutdownCommand = $armedState.ShutdownCommand
         ShutdownCommandStatus = 'Accepted'
         CommandAcceptedUtc = (Get-EffectiveNow).ToUniversalTime().ToString('o')

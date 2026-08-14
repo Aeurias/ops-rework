@@ -9,7 +9,8 @@ $start = Join-Path $root 'Start-AzerothCore.ps1'
 $status = Join-Path $root 'Status-AzerothCore.ps1'
 $archiveScript = Join-Path $root 'New-OpsReworkArchive.ps1'
 $registerSupervisor = Join-Path $root 'Register-Supervisor.ps1'
-$operatorLog = Join-Path $root 'logs\operator-maintenance-test.log'
+$testRoot = Join-Path $root 'test-artifacts\operator-maintenance'
+$operatorLog = Join-Path $testRoot 'operator-maintenance-test.log'
 $marker = Join-Path $root 'state\maintenance-active.json'
 $failures = 0
 
@@ -30,6 +31,8 @@ function Invoke-LoggedDryRun {
     return Invoke-OperatorScript -Path $Path -Arguments @('-DryRun','-TestScenario',$Scenario,'-LogPath',$operatorLog)
 }
 
+if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction Stop }
+New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 Set-Content -LiteralPath $operatorLog -Value ('Operator test run ' + (Get-Date -Format o)) -Encoding UTF8
 
 $stopSource = Get-Content -LiteralPath $stop -Raw
@@ -37,6 +40,7 @@ $startSource = Get-Content -LiteralPath $start -Raw
 $statusSource = Get-Content -LiteralPath $status -Raw
 $archiveSource = Get-Content -LiteralPath $archiveScript -Raw
 $registerSource = Get-Content -LiteralPath $registerSupervisor -Raw
+$watcherRegisterSource = Get-Content -LiteralPath (Join-Path $root 'Register-RestartWatcher.ps1') -Raw
 
 Assert-True ($stopSource -match '(?m)^\s*\$command\s*=\s*''server shutdown 1''\s*$') 'STOP contains exactly the required shutdown command'
 Assert-True ($stopSource -notmatch 'server shutdown 0|server restart\s+\d') 'STOP contains no restart or zero-second shutdown command'
@@ -46,6 +50,8 @@ Assert-True ($startSource -match 'Restart-Watcher\.ps1' -and $startSource -match
 Assert-True ($statusSource -notmatch 'Enable-ScheduledTask|Disable-ScheduledTask|Start-ScheduledTask|Stop-ScheduledTask|Remove-Item|Set-Content|Move-Item|Invoke-WebRequest|Start-Process') 'STATUS source has no mutating cmdlets or SOAP request'
 Assert-True ($statusSource -match 'Get-Process -Name ''worldserver''' -and $statusSource -match 'PathVerification' -and $statusSource -notmatch 'Get-ExactWorldserverProcesses') 'STATUS separates worldserver existence from path verification'
 Assert-True (($registerSource -match '-WindowStyle Hidden') -and ($registerSource -notmatch '-WindowStyle Normal')) 'Register-Supervisor retains hidden PowerShell window'
+Assert-True (($registerSource -match 'InspectionTaskName' -and $watcherRegisterSource -match 'InspectionTaskName') -and ($registerSource -match 'ReplaceExisting' -and $watcherRegisterSource -match 'ReplaceExisting')) 'registration uses distinct inspection names and requires explicit production replacement'
+Assert-True (($registerSource -notmatch 'Unregister-ScheduledTask.*Register-ScheduledTask') -and ($watcherRegisterSource -notmatch 'Unregister-ScheduledTask.*Register-ScheduledTask')) 'registration never unregisters a production task before replacement'
 Assert-True (($archiveSource -match 'restart bot account') -and ($archiveSource -match 'soap-credential') -and ($archiveSource -match 'state\\.*\\.json') -and ($archiveSource -match 'logs')) 'distribution archive excludes secrets and runtime material'
 
 $stopHealthy = Invoke-LoggedDryRun -Path $stop -Scenario 'Healthy'
@@ -61,11 +67,11 @@ Assert-True ($filesystemResult.ExitCode -eq 0 -and $filesystemResult.Output -mat
 Assert-True (-not (Test-Path -LiteralPath $filesystemMarker)) 'filesystem marker test cleans only its isolated test marker'
 Assert-True ((Test-Path -LiteralPath $marker) -eq $liveMarkerBeforeFilesystemTest) 'filesystem marker test leaves live marker unchanged'
 
-foreach ($scenario in @('AlreadyStopped','PathMismatch')) {
+foreach ($scenario in @('AlreadyStopped')) {
     $result = Invoke-LoggedDryRun -Path $stop -Scenario $scenario
     Assert-True ($result.ExitCode -eq 0) "STOP $scenario is idempotent/non-actionable"
 }
-foreach ($scenario in @('WatcherDisableFails','SupervisorDisableFails','SupervisorStopFails','VerificationFails','SoapFailure','ShutdownTimeout','DuplicateWorld')) {
+foreach ($scenario in @('WatcherDisableFails','SupervisorDisableFails','SupervisorStopFails','VerificationFails','SoapFailure','ShutdownTimeout','DuplicateWorld','PathMismatch')) {
     $result = Invoke-LoggedDryRun -Path $stop -Scenario $scenario
     Assert-True ($result.ExitCode -ne 0) "STOP $scenario fails safely"
     Assert-True ($result.Output -notmatch 'would send.*server shutdown 1') "STOP $scenario does not complete shutdown path"
@@ -83,7 +89,7 @@ $startLog = Get-Content -LiteralPath $operatorLog -Raw
 Assert-True ($startLog.LastIndexOf("Disabling task 'AzerothCore Worldserver Restart Watcher'") -lt $startLog.LastIndexOf("Enabling task 'AzerothCore Worldserver Supervisor'") -and $startLog.LastIndexOf('Read-only watcher preflight succeeded') -lt $startLog.LastIndexOf("Enabling task 'AzerothCore Worldserver Restart Watcher'")) 'START keeps watcher disabled until supervisor and preflight succeed'
 $startAlreadyHealthy = Invoke-LoggedDryRun -Path $start -Scenario 'AlreadyHealthy'
 Assert-True ($startAlreadyHealthy.ExitCode -eq 0) 'START already-healthy state is idempotent'
-foreach ($scenario in @('MissingTask','SupervisorEnableFails','SupervisorStartFails','SupervisorStateTimeout','StaleHeartbeat','PidMismatch','StartTimeMismatch','MissingWorld','DuplicateWorld','PreflightFails','WatcherEnableFails')) {
+foreach ($scenario in @('MissingTask','SupervisorEnableFails','SupervisorStartFails','SupervisorStateTimeout','StaleHeartbeat','PidMismatch','StartTimeMismatch','MissingWorld','DuplicateWorld','PathMismatch','PreflightFails','WatcherEnableFails')) {
     $result = Invoke-LoggedDryRun -Path $start -Scenario $scenario
     Assert-True ($result.ExitCode -ne 0) "START $scenario fails safely"
     Assert-True ($result.Output -match 'watcher remains disabled|Restart watcher remains disabled') "START $scenario reports watcher disabled"
@@ -98,6 +104,7 @@ Assert-True ($secondStart.ExitCode -eq 0 -and $secondStart.Output -match 'Anothe
 $statusExpected = @{
     Healthy = 0
     Maintenance = 0
+    MaintenanceTaskUnknown = 1
     StaleSupervisor = 1
     PidMismatch = 1
     Offline = 1
@@ -123,6 +130,7 @@ foreach ($entry in $statusExpected.GetEnumerator()) {
     if ($entry.Key -eq 'MalformedSupervisor') { Assert-True ($result.Output -match 'State file\s+: INVALID' -and $result.Output -match 'OVERALL STATE: ERROR') 'STATUS malformed supervisor state is error' }
     if ($entry.Key -eq 'WatcherDisabled') { Assert-True ($result.Output -match 'Task enabled\s+: Disabled' -and $result.Output -match 'OVERALL STATE: DEGRADED') 'STATUS disabled watcher is degraded' }
     if ($entry.Key -eq 'Maintenance') { Assert-True ($result.Output -match 'OVERALL STATE: MAINTENANCE') 'STATUS maintenance with worldserver absent is not offline' }
+    if ($entry.Key -eq 'MaintenanceTaskUnknown') { Assert-True ($result.Output -match 'ACCESS UNAVAILABLE' -and $result.Output -match 'OVERALL STATE: ERROR') 'STATUS never infers maintenance when task access is unavailable' }
 }
 
 Assert-True ($stopSource -match 'maintenance-active\.json' -and $startSource -match 'maintenance-active\.json') 'maintenance marker is handled only by operator scripts'
@@ -135,8 +143,9 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archivePath)
     try { $entryNames = @($zip.Entries | ForEach-Object FullName) } finally { $zip.Dispose() }
-    $forbiddenEntry = @($entryNames | Where-Object { $_ -match '(?i)(?:^|/)restart bot account\.txt$|(?:^|/)soap-credential\.xml(?:\.|$)|(?:^|/)(?:logs|state)(?:/|$)|\.tmp$|\.zip$' })
-    Assert-True ($forbiddenEntry.Count -eq 0 -and @($entryNames | Where-Object { $_ -eq 'README.md' }).Count -eq 1) 'distribution archive contains no credentials/runtime/log entries'
+    $forbiddenEntry = @($entryNames | Where-Object { $_ -match '(?i)(?:^|/)restart bot account\.txt$|(?:^|/)soap-credential\.xml(?:\.|$)|(?:^|/)(?:logs|state|\.git|_corrective-audit|test-artifacts|backups)(?:/|$)|(?:^|/)(?:watcher-task|supervisor-task)\.xml$|\.tmp$|\.zip$' })
+    $hasOnlyCurrentRootFiles = @($entryNames | Where-Object { $_ -match '/' }).Count -eq 0
+    Assert-True ($forbiddenEntry.Count -eq 0 -and $hasOnlyCurrentRootFiles -and @($entryNames | Where-Object { $_ -eq 'README.md' }).Count -eq 1 -and @($entryNames | Where-Object { $_ -eq '_corrective-audit' -or $_ -match '(?i)^_corrective-audit/' }).Count -eq 0 -and @($entryNames | Where-Object { $_ -eq '.git' -or $_ -match '(?i)^\.git/' }).Count -eq 0) 'distribution archive excludes credentials/runtime/logs/.git/_corrective-audit'
 } finally {
     if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
 }

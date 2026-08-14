@@ -11,7 +11,7 @@
 [CmdletBinding()]
 param(
     [switch] $DryRun,
-    [ValidateSet('Live','Healthy','AlreadyHealthy','MissingTask','SupervisorEnableFails','SupervisorStartFails','SupervisorStateTimeout','StaleHeartbeat','PidMismatch','StartTimeMismatch','MissingWorld','DuplicateWorld','PreflightFails','WatcherEnableFails')]
+    [ValidateSet('Live','Healthy','AlreadyHealthy','MissingTask','SupervisorEnableFails','SupervisorStartFails','SupervisorStateTimeout','StaleHeartbeat','PidMismatch','StartTimeMismatch','MissingWorld','DuplicateWorld','PathMismatch','PreflightFails','WatcherEnableFails')]
     [string] $TestScenario = 'Live',
     [int] $StartupTimeoutSeconds = 300,
     [int] $HoldLockSeconds = 0,
@@ -124,12 +124,21 @@ function Start-SupervisorIfNeeded {
 function Get-ExactWorldserverProcesses {
     if ($DryRun) {
         if ($TestScenario -eq 'MissingWorld') { return @() }
+        if ($TestScenario -eq 'PathMismatch') { throw "Safety stop: worldserver PID=4299 has unexpected executable path 'C:\unexpected\worldserver.exe'; supervisor startup is refused." }
         if ($TestScenario -eq 'DuplicateWorld') { return @([pscustomobject]@{ Pid = 4201; StartTime = (Get-Date).AddHours(-1); StartTimeUtc = ([datetime]::UtcNow).AddHours(-1); Process = $null; Path = $WorldExe },[pscustomobject]@{ Pid = 4202; StartTime = (Get-Date).AddHours(-2); StartTimeUtc = ([datetime]::UtcNow).AddHours(-2); Process = $null; Path = $WorldExe }) }
         return @([pscustomobject]@{ Pid = 4201; StartTime = (Get-Date).AddHours(-1); StartTimeUtc = ([datetime]::UtcNow).AddHours(-1); Process = $null; Path = $WorldExe })
     }
     $expected = [IO.Path]::GetFullPath($WorldExe).TrimEnd('\').ToLowerInvariant()
-    try { $rows = @(Get-CimInstance Win32_Process -Filter "Name='worldserver.exe'" | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath).TrimEnd('\').ToLowerInvariant() -eq $expected) }) } catch { throw "Could not inspect worldserver executable paths: $($_.Exception.Message)" }
-    $result = foreach ($row in $rows) { $process = Get-Process -Id ([int]$row.ProcessId) -ErrorAction Stop; [pscustomobject]@{ Pid = [int]$row.ProcessId; StartTime = $process.StartTime; StartTimeUtc = $process.StartTime.ToUniversalTime(); Process = $process; Path = $row.ExecutablePath } }
+    try { $rows = @(Get-CimInstance Win32_Process -Filter "Name='worldserver.exe'" -ErrorAction Stop) } catch { throw "Could not inspect worldserver executable paths: $($_.Exception.Message)" }
+    $result = foreach ($row in $rows) {
+        $path = [string]$row.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($path)) { throw "Safety stop: worldserver PID=$($row.ProcessId) exists but its executable path is unavailable; supervisor startup is refused." }
+        try { $actual = [IO.Path]::GetFullPath($path).TrimEnd('\').ToLowerInvariant() } catch { throw "Safety stop: worldserver PID=$($row.ProcessId) has an unreadable executable path; supervisor startup is refused." }
+        if ($actual -ne $expected) { throw "Safety stop: worldserver PID=$($row.ProcessId) has unexpected executable path '$path'; supervisor startup is refused." }
+        $process = Get-Process -Id ([int]$row.ProcessId) -ErrorAction Stop
+        [pscustomobject]@{ Pid = [int]$row.ProcessId; StartTime = $process.StartTime; StartTimeUtc = $process.StartTime.ToUniversalTime(); Process = $process; Path = $path }
+    }
+    if (@($rows).Count -gt 1) { throw "Safety stop: $(@($rows).Count) worldserver.exe processes exist; supervisor startup is refused." }
     return @($result)
 }
 
@@ -252,6 +261,11 @@ try {
     $watcher = Get-TaskSnapshot -TaskName $RestartWatcherTaskName
     if (-not $watcher.Exists -or $watcher.Enabled) { throw 'Could not verify the restart watcher is disabled during startup.' }
     Write-OperatorLog 'Restart watcher verified disabled during startup.' 'OK'
+    # Elevated START must account for every worldserver.exe before allowing the
+    # supervisor to start.  Unexpected-path, unreadable-path, or duplicate
+    # processes are hard safety failures and are never silently ignored.
+    $initialWorlds = @(Get-ExactWorldserverProcesses)
+    Write-OperatorLog "Pre-start worldserver inventory is safe; expected-process count=$($initialWorlds.Count)." 'OK'
     Enable-Supervisor
     Start-SupervisorIfNeeded
     $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
