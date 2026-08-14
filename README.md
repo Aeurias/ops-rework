@@ -488,5 +488,5 @@ or ambiguous state requires the manual recovery procedure above:
 Do not use the old `Restart-Azeroth.ps1` or `Register-AzerothTasks.ps1`; they remain
 for audit/history only and contain unsafe behavior. No production file was deleted or
 changed by this staging work.
-#   o p s - r e w o r k  
+ 
  
